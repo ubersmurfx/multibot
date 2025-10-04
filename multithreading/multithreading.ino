@@ -1,4 +1,4 @@
-#include <PS2X_lib.h>  
+#include <PS2X_lib.h>
 // library for support PS2 controller and esp32 https://github.com/MyArduinoLib/Arduino-PS2X-ESP32.git
 
 #define PS2_DAT 19
@@ -25,13 +25,39 @@ byte type = 0;
 int8_t error = -1;
 uint8_t tryNum = 1;
 boolean button1WasUp = true;
+int state = 0; 
 
 // <------------------>
-uint8_t timestamp1 = 250;
-uint8_t timestamp2 = 1500;
-
+unsigned long timer1, timer2;
 // <------------------>
 PS2X ps2x;
+
+// Буфер для обработки прерываний
+volatile int joystickValueL = 128;
+volatile int joystickValueR = 128;
+volatile bool padUp = false;
+volatile bool padDown = false;
+volatile bool padLeft = false;
+volatile bool padRight = false;
+volatile int padUpSpeed = 0;
+volatile int padDownSpeed = 0;
+volatile int padLeftSpeed = 0;
+volatile int padRightSpeed = 0;
+
+// Семафор
+SemaphoreHandle_t xDataSemaphore;
+
+// Переменные для обработки автономного движения
+bool lastButtonState = HIGH;
+unsigned long lastDebounceTime = 0;
+const unsigned long debounceDelay = 50;
+bool ledState = false;
+bool autonomousMode = false; // Флаг автономного движения
+const int autonomousSpeed = 150; // Скорость автономного движения
+
+static bool crossWasPressed = false;
+static bool circleWasPressed = false;
+
 
 class Motor {
 private:
@@ -44,22 +70,23 @@ public:
     pinMode(pinGnd, OUTPUT);
     stop();
   }
-  
-  // Движение вперед
+
   void forward(int speed) {
     speed = constrain(speed, 0, 255);
     analogWrite(pinUp, speed);
     analogWrite(pinGnd, 0);
+    Serial.print("вперед");
+    Serial.println(speed);
   }
   
-  // Движение назад
   void backward(int speed) {
     speed = constrain(speed, 0, 255);
     analogWrite(pinGnd, speed);
     analogWrite(pinUp, 0);
+    Serial.print("назад");
+    Serial.println(speed);
   }
   
-  // Остановка
   void stop() {
     analogWrite(pinUp, 0);
     analogWrite(pinGnd, 0);
@@ -68,6 +95,128 @@ public:
 
 Motor leftMotor(L_UP, L_GND);
 Motor rightMotor(R_UP, R_GND);
+
+void joystickTask(void *parameter) {
+  while (1) {
+    if (type == 1) {
+      ps2x.read_gamepad(false, vibrate);
+      if (xSemaphoreTake(xDataSemaphore, portMAX_DELAY) == pdTRUE) {
+        joystickValueL = ps2x.Analog(PSS_LY);  
+        joystickValueR = ps2x.Analog(PSS_RY);
+
+        padUp = ps2x.Button(PSB_PAD_UP);
+        padDown = ps2x.Button(PSB_PAD_DOWN);
+        padLeft = ps2x.Button(PSB_PAD_LEFT);
+        padRight = ps2x.Button(PSB_PAD_RIGHT);
+        
+        if (padUp) padUpSpeed = ps2x.Analog(PSAB_PAD_UP);
+        if (padDown) padDownSpeed = ps2x.Analog(PSAB_PAD_DOWN);
+        if (padLeft) padLeftSpeed = ps2x.Analog(PSAB_PAD_LEFT);
+        if (padRight) padRightSpeed = ps2x.Analog(PSAB_PAD_RIGHT);
+        
+        xSemaphoreGive(xDataSemaphore);
+      }
+    }
+    
+    vTaskDelay(50 / portTICK_PERIOD_MS);
+  }
+}
+
+void activate_profilimetr() {
+  digitalWrite(ledPin, HIGH);
+  digitalWrite(ledPin2, HIGH);
+  digitalWrite(ledPin3, HIGH);
+  digitalWrite(ledPin4, HIGH);
+}
+
+void deactivate_profilimetr() {
+  digitalWrite(ledPin, LOW);
+  digitalWrite(ledPin2, LOW);
+  digitalWrite(ledPin3, LOW);
+  digitalWrite(ledPin4, LOW);
+}
+
+void task_cross() {
+  if (ps2x.Button(PSB_CROSS)) {
+    if (!crossWasPressed) {
+      crossWasPressed = true;
+      Serial.println("cross");
+      state = 0;
+      Serial.print("current state");
+      Serial.print(state);
+    }
+  } else {
+    crossWasPressed = false;
+  }
+}
+
+void task_circle() {
+  if (ps2x.Button(PSB_CIRCLE)) {
+    if (!circleWasPressed) {
+      circleWasPressed = true;
+      Serial.println("circle");
+      autonomousMode = false;
+      leftMotor.forward(0);
+      rightMotor.forward(0);
+      deactivate_profilimetr();
+      Serial.print("current mode auto: false");
+    }
+  } else {
+    circleWasPressed = false;
+  }
+}
+
+// 1. Нажали кнопку
+// 2. Ждём 2 секунды
+// 3. Включаем профилемер (лазеры)
+// 4. Едем 160 см.
+
+void auto_task() {
+    switch(state) {
+    case 0: // получить время
+      if (autonomousMode == false) {
+        return;
+      }
+      Serial.print("state0");
+      timer1 = millis();
+      state = 1;
+      break;
+    case 1: // выполнить движение
+      if (autonomousMode == false) {
+        return;
+      }
+      Serial.print("state1");
+      if (nonblockdelay(2000, timer1)) {
+        activate_profilimetr();
+        leftMotor.forward(255);
+        rightMotor.forward(255);
+        timer2 = millis();
+        state = 2;
+      }
+      break;
+    case 2: // остановка
+      if (autonomousMode == false) {
+        return;
+      }
+        Serial.print("state2");
+      if (nonblockdelay(5000, timer2)) {
+        deactivate_profilimetr();
+        leftMotor.forward(0);
+        rightMotor.forward(0);
+        state = 3;
+      }
+      break;
+  }
+}
+
+bool nonblockdelay(const long interval, unsigned long &previousTime) {
+  unsigned long currentMillis = millis();
+  if (currentMillis - previousTime >= interval) {
+    previousTime = currentMillis;
+    return true;
+  }
+  return false;
+}
 
 void setup() {
   pinMode(BT1, INPUT_PULLUP);
@@ -114,70 +263,79 @@ void setup() {
       Serial.println("Обнаружен беспроводной контроллер Sony DualShock");
       break;
   }
+  
+  // семафор
+  xDataSemaphore = xSemaphoreCreateMutex();
+  // Пока реализация на задачах
+  xTaskCreatePinnedToCore(
+    joystickTask,    // Функция задачи
+    "JoystickTask",  // Имя задачи
+    10000,           // Размер стека
+    NULL,            // Параметры
+    1,               // Приоритет
+    NULL,            // Handle задачи
+    0                // Ядро (0 или 1)
+  );
+
+  Serial.println("Задача джойстика создана");
 }
 
 void loop() {
-  boolean button1IsUp = digitalRead(BT1);
-  
-  // Читаем состояние кнопки
+  task_cross();
+  task_circle();
   int buttonState = digitalRead(BT1);
-  
-  // Если кнопка нажата (INPUT_PULLUP - нажатие дает LOW)
-  if (buttonState == LOW) {
-    digitalWrite(ledPin, HIGH);  // Включаем светодиод
-    delay(1000);
-    Serial.println("Кнопка нажата - светодиод включен");
+
+  if (buttonState == LOW and ) {
+    autonomousMode = true;
+    auto_task();
   } else {
-    digitalWrite(ledPin, LOW);   // Выключаем светодиод
+    Serial.println("Auto Off");
   }
-  
-  button1WasUp = button1IsUp;
 
   if (type == 1) {
-    ps2x.read_gamepad(false, vibrate);
-    int valueL = ps2x.Analog(PSS_LY);  
-    int valueR = ps2x.Analog(PSS_RY);
+    Serial.print("JOY:");
+    Serial.println(joystickValueL);
+    if (xSemaphoreTake(xDataSemaphore, portMAX_DELAY) == pdTRUE) {
+      if (joystickValueL==128) {
+      }
+      else if (joystickValueL > 127) {
+        leftMotor.backward(abs(128 - joystickValueL) * 2 + 1);
+      } else {
+        leftMotor.forward((127 - joystickValueL) * 2 + 1);
+      }
 
-    if (valueL > 127) {
-      leftMotor.forward(abs(128 - valueL) * 2 + 1);
-    } else {
-      leftMotor.backward((127 - valueL) * 2 + 1);
-    }
-
-    if (valueR > 127) {
-      rightMotor.forward(abs(128 - valueR) * 2 + 1);
-    } else {
-      rightMotor.backward((127 - valueR) * 2 + 1);
-    }
-    
-    if (ps2x.Button(PSB_PAD_UP)) { // движение вперед
-      int speed = ps2x.Analog(PSAB_PAD_UP);
-      Serial.println("вперед");
-      leftMotor.forward(speed);
-      rightMotor.forward(speed);
-    }
-    
-    if (ps2x.Button(PSB_PAD_RIGHT)) { // поворот направо
-      int speed = ps2x.Analog(PSAB_PAD_RIGHT);
-      Serial.println("направо");
-      leftMotor.forward(speed);
-      rightMotor.backward(speed);
-    }
-    
-    if (ps2x.Button(PSB_PAD_LEFT)) { // поворот налево
-      int speed = ps2x.Analog(PSAB_PAD_LEFT);
-      Serial.println("налево");
-      leftMotor.backward(speed);
-      rightMotor.forward(speed);
-    }
-    
-    if (ps2x.Button(PSB_PAD_DOWN)) { // движение назад
-      int speed = ps2x.Analog(PSAB_PAD_DOWN);
-      Serial.println("назад");
-      leftMotor.backward(speed);
-      rightMotor.backward(speed);
+      // Управление правым мотором через правый джойстик
+      if (joystickValueR==128) {
+      }
+      else if (joystickValueR > 127) {
+        rightMotor.backward(abs(128 - joystickValueR) * 2 + 1);
+      } else {
+        rightMotor.forward((127 - joystickValueR) * 2 + 1);
+      }
+      
+      // Управление через кнопки крестовины (приоритет над джойстиками)
+      if (padUp) { // движение вперед
+        leftMotor.forward(padUpSpeed);
+        rightMotor.forward(padUpSpeed);
+      }
+      
+      if (padRight) { // поворот направо
+        leftMotor.forward(padRightSpeed);
+        rightMotor.backward(padRightSpeed);
+      }
+      
+      if (padLeft) { // поворот налево
+        leftMotor.backward(padLeftSpeed);
+        rightMotor.forward(padLeftSpeed);
+      }
+      
+      if (padDown) { // движение назад
+        leftMotor.backward(padDownSpeed);
+        rightMotor.backward(padDownSpeed);
+      }
+      xSemaphoreGive(xDataSemaphore);
     }
   }
-  
-  delay(100); // Задержка для стабильной работы
+  delay(10);
 }
+
